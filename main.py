@@ -1,19 +1,55 @@
-class car:
-    def __init__(self, mark, year, speed):
-        self.mark = mark
-        self.speed = speed
-        self.year = year
+import torch
+from torch import nn
 
-    def set_speed(self, speed):
-        if speed > 0:
-            self.speed = speed    
+w = torch.tensor(2.4, requires_grad=True)
+"""
+opt = torch.optim.SGD([w],  lr = 0.01)
 
-    def __str__(self):
-        return f'{self.speed}, {self.mark}, {self.year}'
+for i in range (100): 
+    y = (w * 3 + 2) ** 2
+    opt.zero_grad()
+    y.backward()
+    opt.step()
+    #print(w.grad)
 
-    def describe(self):
-        print(f'{self.speed}, {self.mark}, {self.year}')
 
-f1 = car("bmw", "2005", 0)
-print(f1)
-    
+print(w)
+
+
+
+net = nn.Sequential(nn.Linear(100,1), nn.ReLU(), nn.Linear(4, 2))
+x = torch.tensor([1.3, 2.2, 2.5])
+print(net(x))           # слой вызывают как функцию
+
+count = 0
+
+for p in net.parameters():
+    print(p.shape)
+    count += p.numel()
+print(count)  
+
+"""
+"""
+net = nn.Sequential(nn.Linear(1, 1))
+net.load_state_dict(torch.load("model.pth", weights_only=True))
+
+#x = torch.rand(100,1)
+
+test_x = torch.tensor([[0], [0.5], [1]])
+#correct_ans = 2 * x + 1
+with torch.no_grad():
+    print(net(test_x))
+
+opt = torch.optim.SGD(net.parameters(), lr = 0.01)
+loss_fn = nn.MSELoss()
+
+for i in range (2000):
+    opt.zero_grad()
+    loss = loss_fn(net(x), correct_ans)
+    loss.backward()
+    opt.step()
+    if i % 10 == 0:
+       print(loss.item()) 
+
+torch.save(net.state_dict(), "model.pth")
+"""
