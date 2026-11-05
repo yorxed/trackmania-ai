@@ -93,16 +93,17 @@ DECISION_EVERY_MS = 50
 MAX_EPISODE_MS = 90_000
 STUCK_WINDOW_MS, STUCK_MIN_MOVE_M = 3000, 3.0
 NO_PROGRESS_MS = 8000
-GAME_SPEED = 5.0
+GAME_SPEED = 20.0
 
 # --- Награда (на одно решение) ---
 PROGRESS_SCALE = 0.1                          # награда за метр продвижения вдоль призрака
 PROGRESS_CLIP = (-2.0, 8.0)                   # прирост за шаг обрезаем: защита от скачков индекса на призраке
 STEP_PENALTY = {1: 0.01, 2: 0.03, 3: 0.03}    # штраф за каждое решение
-CP_REWARD = 2.0                               # за каждый чекпоинт (финиш тоже считается)
-FINISH_REWARD = 10.0
+CP_REWARD = 50.0                               # за каждый чекпоинт (финиш тоже считается)
+FINISH_REWARD = 100.0
 TIME_REWARD_PER_SEC = {1: 0.0, 2: 0.3, 3: 0.3}  # за секунду, сэкономленную до MAX_EPISODE_MS
-CRASH_PENALTY = -5.0                          # если застряла / нет прогресса
+CRASH_PENALTY = -30.0   # если застряла / нет прогресса
+BACKWARD_PENALTY = 0.3
 
 # --- Этапы ---
 STAGE1_FINISHES, STAGE1_WINDOW = 3, 5         # этап 2, когда финишировали 3 из последних 5
@@ -174,7 +175,12 @@ class Tracker:
         # --- награда ---
         reward = -STEP_PENALTY[self.stage]
         if self.last_progress is not None:
-            reward += PROGRESS_SCALE * max(PROGRESS_CLIP[0], min(PROGRESS_CLIP[1], p - self.last_progress))
+            delta_progress = p - self.last_progress
+
+            if delta_progress > 0:
+                reward += PROGRESS_SCALE * min(delta_progress, 8.0)
+            else:
+                reward += 0.3 * max(delta_progress, -2.0)
         self.last_progress = p
         if p > self.best_progress + 1.0:
             self.last_gain_t = t_ms
