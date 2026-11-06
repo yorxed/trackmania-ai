@@ -104,6 +104,8 @@ FINISH_REWARD = 100.0
 TIME_REWARD_PER_SEC = {1: 0.0, 2: 0.3, 3: 0.3}  # за секунду, сэкономленную до MAX_EPISODE_MS
 CRASH_PENALTY = -30.0   # если застряла / нет прогресса
 BACKWARD_PENALTY = 0.3
+SPEED_REWARD_SCALE = 0.05
+SPEED_REWARD_MAX = 2.0
 
 # --- Этапы ---
 STAGE1_FINISHES, STAGE1_WINDOW = 3, 5         # этап 2, когда финишировали 3 из последних 5
@@ -174,6 +176,9 @@ class Tracker:
 
         # --- награда ---
         reward = -STEP_PENALTY[self.stage]
+        if self.stage == 1:
+            speed = raw.speed
+            reward += min(speed * SPEED_REWARD_SCALE, SPEED_REWARD_MAX)
         if self.last_progress is not None:
             delta_progress = p - self.last_progress
 
@@ -188,6 +193,10 @@ class Tracker:
         new_cps, self.cp_paid = self.cp - self.cp_paid, self.cp
         reward += CP_REWARD * new_cps
         terminal = truncated = False
+        if raw.pos[1] < 20:
+            reward -= 100.0
+            terminal = True
+            self.reason = "падение с трассы"
         if self.finished:
             reward += FINISH_REWARD
             reward += TIME_REWARD_PER_SEC[self.stage] * max(0.0, (MAX_EPISODE_MS - self.finish_ms) / 1000.0)
