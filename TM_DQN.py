@@ -93,7 +93,7 @@ DECISION_EVERY_MS = 50
 MAX_EPISODE_MS = 90_000
 STUCK_WINDOW_MS, STUCK_MIN_MOVE_M = 3000, 3.0
 NO_PROGRESS_MS = 8000
-GAME_SPEED = 20.0
+GAME_SPEED = 8.0
 
 # --- Награда (на одно решение) ---
 PROGRESS_SCALE = 0.1                          # награда за метр продвижения вдоль призрака
