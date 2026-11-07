@@ -14,6 +14,7 @@ tm_common.py - общая часть для логгера (TMlogger.py) и аг
 Положи этот файл в одну папку с TMlogger.py и tm_dqn.py.
 """
 
+import csv
 import math
 
 import numpy as np
@@ -117,22 +118,26 @@ def build_observation(raw: RawState, origin=(0.0, 0.0), ghost_feats=NO_GHOST_FEA
 class Ghost:
     """Путь лучшего заезда. Прогресс = расстояние вдоль него от старта."""
 
-    def __init__(self, xs, zs, finished=False, finish_ms=None):
+    def __init__(self, xs, zs, finished=False, finish_ms=None, ys=None):
         xs, zs = np.asarray(xs, float), np.asarray(zs, float)
-        self.raw_x, self.raw_z = xs, zs
+        ys = None if ys is None or len(ys) != len(xs) else np.asarray(ys, float)   # ys - высота (pos_y), необязательна
+        self.raw_x, self.raw_z, self.raw_y = xs, zs, ys
         self.finished, self.finish_ms = bool(finished), finish_ms
         keep = [0]
         for i in range(1, len(xs)):
             if math.hypot(xs[i] - xs[keep[-1]], zs[i] - zs[keep[-1]]) > 0.5:
                 keep.append(i)
         xs, zs = xs[keep], zs[keep]
+        ys = None if ys is None else ys[keep]
         if len(xs) < 3:                       # заезд почти не двигался
             xs = np.array([xs[0], xs[0] + 1.0, xs[0] + 2.0])
             zs = np.array([zs[0], zs[0], zs[0]])
+            ys = None
         seg = np.hypot(np.diff(xs), np.diff(zs))
         s = np.concatenate([[0.0], np.cumsum(seg)])
         grid = np.arange(0.0, s[-1], GHOST_SPACING)
         self.x, self.z, self.s = np.interp(grid, s, xs), np.interp(grid, s, zs), grid
+        self.y = None if ys is None else np.interp(grid, s, ys)
         self.n, self.length, self.last_idx = len(grid), float(s[-1]), 0
         i = np.arange(self.n)
         a, b = np.maximum(i - GHOST_ANGLE_SPAN, 0), np.minimum(i + GHOST_ANGLE_SPAN, self.n - 1)
@@ -145,7 +150,29 @@ class Ghost:
         if "ghost_x" not in d.files or d["ghost_x"].size < 3:
             return None
         ms = int(d["ghost_ms"])
-        return Ghost(d["ghost_x"], d["ghost_z"], bool(int(d["ghost_fin"])), None if ms < 0 else ms)
+        ys = d["ghost_y"] if "ghost_y" in d.files else None          # старые сохранения без высоты тоже читаются
+        return Ghost(d["ghost_x"], d["ghost_z"], bool(int(d["ghost_fin"])), None if ms < 0 else ms, ys)
+
+    @staticmethod
+    def from_csv(path, episode=None):
+        """
+        Эталонный призрак из CSV логгера (TMlogger.py): твой собственный заезд.
+        episode - номер заезда в файле (столбец episode); по умолчанию последний.
+        Заезд считается финишировавшим, время финиша = время последней строки заезда.
+        Берись за заезд, который ты довёл до финиша и в котором логгер писал до самого конца!
+        """
+        rows = {}
+        with open(path, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                rows.setdefault(int(r["episode"]), []).append(r)
+        if not rows:
+            raise ValueError(f"{path}: файл пустой")
+        ep = max(rows) if episode is None else episode
+        if ep not in rows:
+            raise ValueError(f"{path}: нет заезда {ep}; в файле есть: {sorted(rows)}")
+        rs = rows[ep]
+        return Ghost([float(r["pos_x"]) for r in rs], [float(r["pos_z"]) for r in rs], True,
+                     int(float(rs[-1]["time_ms"])), [float(r["pos_y"]) for r in rs])
 
     def key(self):
         """Больше = лучше: финишировавший > нефинишировавшего; среди финишировавших быстрее; иначе длиннее."""
@@ -153,6 +180,10 @@ class Ghost:
 
     def reset(self):
         self.last_idx = 0
+
+    def height(self):
+        """Высота призрака (y) в ближайшей к машине точке (после progress_at). None, если высоты нет."""
+        return None if self.y is None else float(self.y[self.last_idx])
 
     def progress_at(self, x, z):
         """Пройденное вдоль призрака расстояние (м) для точки (x, z). Ищет ближайшую точку в окне вокруг прошлой."""

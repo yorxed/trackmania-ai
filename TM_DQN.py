@@ -99,8 +99,8 @@ GAME_SPEED = 5.0
 PROGRESS_SCALE = 0.1                          # награда за метр продвижения вдоль призрака
 PROGRESS_CLIP = (-2.0, 8.0)                   # прирост за шаг обрезаем: защита от скачков индекса на призраке
 STEP_PENALTY = {1: 0.01, 2: 0.03, 3: 0.03}    # штраф за каждое решение
-CP_REWARD = 2.0                               # за каждый чекпоинт (финиш тоже считается)
-FINISH_REWARD = 10.0
+CP_REWARD = 20.0                               # за каждый чекпоинт (финиш тоже считается)
+FINISH_REWARD = 30.0
 TIME_REWARD_PER_SEC = {1: 0.0, 2: 0.3, 3: 0.3}  # за секунду, сэкономленную до MAX_EPISODE_MS
 CRASH_PENALTY = -5.0                          # если застряла / нет прогресса
 
@@ -182,6 +182,10 @@ class Tracker:
         new_cps, self.cp_paid = self.cp - self.cp_paid, self.cp
         reward += CP_REWARD * new_cps
         terminal = truncated = False
+        if raw.pos[1] < 20:
+            reward -= 50.0
+            terminal = True
+            self.reason = "падение с трассы"
         if self.finished:
             reward += FINISH_REWARD
             reward += TIME_REWARD_PER_SEC[self.stage] * max(0.0, (MAX_EPISODE_MS - self.finish_ms) / 1000.0)
@@ -340,7 +344,7 @@ class ReplayBuffer:
 # =============================================================================
 
 class Trainer:
-    def __init__(self, backend, state_base=STATE_BASE, fresh=False, play=False, seed=None):
+    def __init__(self, backend, state_base=STATE_BASE, fresh=False, play=False, seed=None, reference=None):
         self.backend, self.state_base, self.play = backend, state_base, play
         if seed is not None:
             random.seed(seed)
@@ -360,6 +364,18 @@ class Trainer:
                   f"рекорд {self._fmt(self.best_time_ms)}")
         else:
             print("Начинаю с нуля.")
+        self._apply_reference(reference)
+
+    def _apply_reference(self, ref):
+        """Эталон (твой заезд из CSV) становится призраком, если он лучше текущего (финишировал и быстрее).
+        Когда агент проедет быстрее эталона, призрак заменится его заездом."""
+        if ref is None:
+            return
+        if self.ghost is None or ref.key() > self.ghost.key():
+            self.ghost = ref
+            print(f"Призрак = эталон: длина {ref.length:.0f} м, время {ref.finish_ms / 1000:.2f} с.")
+        else:
+            print("Текущий призрак лучше эталона - оставляю его.")
 
     @staticmethod
     def _fmt(ms):
@@ -539,12 +555,19 @@ def make_client(trainer):
     return DQNClient()
 
 
+def load_reference(args):
+    """Эталон из CSV (--reference), или None."""
+    if not getattr(args, "reference", None):
+        return None
+    return Ghost.from_csv(args.reference, getattr(args, "ref_episode", None))
+
+
 def mode_live(args):
     from tminterface.client import run_client
     backend = DQNBackend()
     check_learn_is_written(backend)
     # в режиме --play сохранение только читается: Trainer при play=True ничего не пишет на диск
-    trainer = Trainer(backend, state_base=args.state, fresh=args.fresh, play=args.play)
+    trainer = Trainer(backend, state_base=args.state, fresh=args.fresh, play=args.play, reference=load_reference(args))
     client = make_client(trainer)
     print("Подключаюсь к TMInterface0...")
     run_client(client, "TMInterface0")
@@ -624,7 +647,7 @@ def run_fake_episode(env, trainer):
 def mode_selftest(args, backend=None):
     backend = backend or DQNBackend()
     check_learn_is_written(backend)
-    trainer = Trainer(backend, state_base=None, fresh=True, seed=args.seed)
+    trainer = Trainer(backend, state_base=None, fresh=True, seed=args.seed, reference=load_reference(args))
     env = FakeTrack()
     print(f"Выдуманная трасса, эпизодов {args.episodes}. Параметров сети: "
           f"{OBS_SIZE * HIDDEN + HIDDEN + HIDDEN * HIDDEN + HIDDEN + HIDDEN * N_ACTIONS + N_ACTIONS}\n")
@@ -648,6 +671,8 @@ def main():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--state", default=STATE_BASE, help="база имени файлов сохранения")
     p.add_argument("--fresh", action="store_true", help="игнорировать сохранение")
+    p.add_argument("--reference", metavar="CSV", help="эталон: CSV твоего заезда от TMlogger.py (станет призраком)")
+    p.add_argument("--ref-episode", type=int, default=None, help="номер заезда в CSV (столбец episode); по умолчанию последний")
     p.add_argument("--play", action="store_true", help="--live: только ехать (ε=0), без обучения и сохранения")
     args = p.parse_args()
     mode_selftest(args) if args.selftest else mode_live(args)
