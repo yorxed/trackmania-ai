@@ -48,10 +48,16 @@ tm_dqn.py - DQN для Trackmania Nations Forever (TMInterface 1.4.x).
 """
 
 import argparse
+import csv
+import json
 import math
 import os
 import random
+import shutil
+import subprocess
 import sys
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -112,6 +118,13 @@ STAGE2_STALL_EPISODES = 30                    # этап 3, когда стол�
 STATE_BASE = "dqn_state"       # будут файлы dqn_state.pt (веса) и dqn_state.npz (всё остальное)
 SAVE_EVERY_EPISODES = 5
 SAVE_BUFFER = True             # буфер на диске занимает порядка 15 МБ
+
+# --- Автоматический git push (включается флагом --git-push) ---
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))   # репозиторий = папка со скриптом
+CHECKPOINT_DIR = "checkpoints"                          # сюда складываются модель, лучший заезд, лог
+GIT_PUSH_MIN_INTERVAL_S = 600                           # не чаще раза в 10 минут (события между ними объединяются)
+LOG_HEADER = ["episode", "stage", "eps", "reward", "progress_m", "checkpoints", "reason", "decisions",
+              "finish_ms", "loss", "best_time_ms", "unix_time"]
 
 
 # =============================================================================
@@ -344,8 +357,11 @@ class ReplayBuffer:
 # =============================================================================
 
 class Trainer:
-    def __init__(self, backend, state_base=STATE_BASE, fresh=False, play=False, seed=None, reference=None):
+    def __init__(self, backend, state_base=STATE_BASE, fresh=False, play=False, seed=None, reference=None,
+                 log_path=None, git_push=False):
         self.backend, self.state_base, self.play = backend, state_base, play
+        self.log_path, self.git_push = log_path, git_push
+        self._pending_event, self._last_push, self._push_thread = None, 0.0, None
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -375,7 +391,10 @@ class Trainer:
             self.ghost = ref
             print(f"Призрак = эталон: длина {ref.length:.0f} м, время {ref.finish_ms / 1000:.2f} с.")
         else:
-            print("Текущий призрак лучше эталона - оставляю его.")
+            cur = self.ghost
+            cur_s = f"{cur.finish_ms / 1000:.2f} с" if cur.finished else f"не финишировал, {cur.length:.0f} м"
+            print(f"Призрак из сохранения ({cur_s}) не хуже эталона ({ref.finish_ms / 1000:.2f} с) - оставляю его. "
+                  "Это нормально, если время то же самое. Чтобы начать с эталона заново, удали dqn_state.npz и dqn_state.pt.")
 
     @staticmethod
     def _fmt(ms):
@@ -416,29 +435,141 @@ class Trainer:
         self.episodes += 1
         note = ""
         if not self.play:
+            event = None
             cand = Ghost(tr.path_x, tr.path_z, tr.finished, tr.finish_ms)
             if self.ghost is None or cand.key() > self.ghost.key():
                 self.ghost = cand
+                if not cand.finished:
+                    event = f"самый длинный путь {cand.length:.0f} м"
             improved = tr.finished and (self.best_time_ms is None or tr.finish_ms < self.best_time_ms)
             if improved:
                 self.best_time_ms, self.eps_since_best = tr.finish_ms, 0
                 note = "  * новый рекорд"
+                event = f"новый рекорд {tr.finish_ms / 1000:.2f} с"
             elif self.stage == 2:
                 self.eps_since_best += 1
             self.recent_finishes.append(bool(tr.finished))
             if self.stage == 1 and len(self.recent_finishes) == STAGE1_WINDOW \
                     and sum(self.recent_finishes) >= STAGE1_FINISHES:
                 self._next_stage(2, "ЭТАП 2: теперь учимся ехать быстро")
+                event = "этап 2"
                 note += "  >>> ЭТАП 2: теперь учимся ехать быстро"
             elif self.stage == 2 and self.eps_since_best >= STAGE2_STALL_EPISODES:
                 self._next_stage(3, "ЭТАП 3: тонкая доводка")
+                event = "этап 3"
                 note += "  >>> ЭТАП 3: тонкая доводка, рекорд без остановки"
             if self.state_base and self.episodes % SAVE_EVERY_EPISODES == 0:
                 self._save()
+            self._log_episode(tr)
+            if event:
+                self._pending_event = event       # запомним: отправим на GitHub, как только пройдёт пауза
+            self._maybe_push()
         loss = "-" if self.last_loss is None else f"{self.last_loss:.3f}"
         return (f"эп {self.episodes:4d} | этап {self.stage} | eps {self.epsilon():.2f} | награда {tr.total_reward:7.1f} | "
                 f"прогресс {tr.best_progress:6.0f} м | cp {tr.cp} | {tr.reason:13s} | решений {tr.steps:5d} | "
                 f"потери {loss} | рекорд {self._fmt(self.best_time_ms)}{note}")
+
+    # ---------- лог заездов и автоматический git push ----------
+    def _log_episode(self, tr):
+        """Одна строка на заезд в CSV (для графиков обучения в курсовой)."""
+        if not self.log_path:
+            return
+        try:
+            new = not os.path.exists(self.log_path) or os.path.getsize(self.log_path) == 0
+            with open(self.log_path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(LOG_HEADER)
+                w.writerow([self.episodes, self.stage, round(self.epsilon(), 3), round(tr.total_reward, 2),
+                            round(tr.best_progress, 1), tr.cp, tr.reason, tr.steps,
+                            tr.finish_ms if tr.finished else "",
+                            "" if self.last_loss is None else round(self.last_loss, 4),
+                            "" if self.best_time_ms is None else self.best_time_ms, int(time.time())])
+        except OSError as e:
+            print(f"лог: не удалось записать ({e})")
+
+    def _write_checkpoint(self):
+        """Складывает в папку checkpoints: модель, лучший заезд (в формате эталона), статус, лог."""
+        d = os.path.join(REPO_DIR, CHECKPOINT_DIR)
+        os.makedirs(d, exist_ok=True)
+        if self.state_base:
+            self._save()
+            if os.path.exists(self.state_base + ".pt"):
+                shutil.copy(self.state_base + ".pt", os.path.join(d, "model.pt"))
+        g = self.ghost
+        if g is not None:
+            n = len(g.raw_x)
+            ys = getattr(g, "raw_y", None)
+            with open(os.path.join(d, "ghost_best.csv"), "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["time_ms", "pos_x", "pos_y", "pos_z", "episode"])
+                for i in range(n):
+                    t = round(i * g.finish_ms / (n - 1)) if g.finished and g.finish_ms and n > 1 else i * DECISION_EVERY_MS
+                    w.writerow([t, round(float(g.raw_x[i]), 3), 0.0 if ys is None else round(float(ys[i]), 3),
+                                round(float(g.raw_z[i]), 3), 0])
+        with open(os.path.join(d, "status.json"), "w", encoding="utf-8") as f:
+            json.dump({"episodes": self.episodes, "stage": self.stage, "best_time_ms": self.best_time_ms,
+                       "ghost_length_m": None if g is None else round(g.length, 1),
+                       "ghost_finished": None if g is None else g.finished,
+                       "updated_unix": int(time.time())}, f, ensure_ascii=False, indent=2)
+        if self.log_path and os.path.exists(self.log_path):
+            shutil.copy(self.log_path, os.path.join(d, "training_log.csv"))
+
+    def _maybe_push(self, force=False):
+        """Если есть, что отправлять, и пауза прошла - пишет файлы и запускает git push в фоне."""
+        if not self.git_push or self._pending_event is None:
+            return
+        if self._push_thread is not None and self._push_thread.is_alive():
+            return
+        if not force and time.time() - self._last_push < GIT_PUSH_MIN_INTERVAL_S:
+            return
+        event, self._pending_event = self._pending_event, None
+        self._last_push = time.time()
+        try:
+            self._write_checkpoint()
+        except Exception as e:                      # обучение не должно падать из-за git
+            print(f"git: не удалось подготовить файлы ({e})")
+            return
+        msg = f"checkpoint: эпизод {self.episodes}, {event}"
+        self._push_thread = threading.Thread(target=self._git_push, args=(msg,), daemon=True)
+        self._push_thread.start()
+
+    @staticmethod
+    def _git_push(msg):
+        """Выполняется в фоновом потоке: игра не ждёт сеть. Ошибки только печатаются."""
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")        # без запросов пароля: в фоне некому отвечать
+
+        def git(*a):
+            r = subprocess.run(["git", *a], cwd=REPO_DIR, capture_output=True, text=True, timeout=120, env=env)
+            return r
+        try:
+            r = git("add", "-f", "--", CHECKPOINT_DIR)
+            if r.returncode:
+                raise RuntimeError(r.stderr.strip() or "git add")
+            r = git("commit", "-m", msg, "--", CHECKPOINT_DIR)          # только папка checkpoints: остальное не трогаем
+            if r.returncode and "nothing to commit" not in (r.stdout + r.stderr):
+                raise RuntimeError(r.stderr.strip() or r.stdout.strip() or "git commit")
+            r = git("push", "-u", "origin", "HEAD")
+            if r.returncode:
+                raise RuntimeError(r.stderr.strip() or "git push")
+            print(f"git: отправлено - {msg}")
+        except Exception as e:
+            print(f"git: не удалось отправить ({e}). Обучение продолжается.")
+
+    def finish(self):
+        """Вызвать при остановке: последнее сохранение и (если включено) последний push."""
+        if self.play:
+            return
+        try:
+            if self.state_base:
+                self._save()
+            if self.git_push:
+                self._pending_event = self._pending_event or "остановка обучения"
+                self._maybe_push(force=True)
+                if self._push_thread is not None:
+                    self._push_thread.join(timeout=150)
+        except Exception as e:
+            print(f"финальное сохранение: {e}")
 
     def _next_stage(self, stage, _msg):
         self.stage = stage
@@ -567,10 +698,14 @@ def mode_live(args):
     backend = DQNBackend()
     check_learn_is_written(backend)
     # в режиме --play сохранение только читается: Trainer при play=True ничего не пишет на диск
-    trainer = Trainer(backend, state_base=args.state, fresh=args.fresh, play=args.play, reference=load_reference(args))
+    trainer = Trainer(backend, state_base=args.state, fresh=args.fresh, play=args.play, reference=load_reference(args),
+                      log_path=None if args.play else args.log, git_push=args.git_push and not args.play)
     client = make_client(trainer)
-    print("Подключаюсь к TMInterface0...")
-    run_client(client, "TMInterface0")
+    print("Подключаюсь к TMInterface0..." + ("  (авто git push включён)" if trainer.git_push else ""))
+    try:
+        run_client(client, "TMInterface0")
+    finally:
+        trainer.finish()                  # при Ctrl+C / закрытии игры / ошибке: сохраниться и отправить
 
 
 # =============================================================================
@@ -673,6 +808,9 @@ def main():
     p.add_argument("--fresh", action="store_true", help="игнорировать сохранение")
     p.add_argument("--reference", metavar="CSV", help="эталон: CSV твоего заезда от TMlogger.py (станет призраком)")
     p.add_argument("--ref-episode", type=int, default=None, help="номер заезда в CSV (столбец episode); по умолчанию последний")
+    p.add_argument("--git-push", action="store_true",
+                   help="--live: при новом рекорде/этапе класть модель и лучший заезд в checkpoints/ и делать git push")
+    p.add_argument("--log", default="training_log.csv", help="--live: CSV с одной строкой на заезд ('' - не писать)")
     p.add_argument("--play", action="store_true", help="--live: только ехать (ε=0), без обучения и сохранения")
     args = p.parse_args()
     mode_selftest(args) if args.selftest else mode_live(args)
