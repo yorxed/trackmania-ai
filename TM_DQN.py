@@ -100,6 +100,9 @@ MAX_EPISODE_MS = 90_000
 STUCK_WINDOW_MS, STUCK_MIN_MOVE_M = 3000, 3.0
 NO_PROGRESS_MS = 8000
 GAME_SPEED = 5.0
+GIVE_UP_RETRY_MS = 1000       # если рестарт не произошёл, повторять give_up() каждые столько мс игрового времени
+MENU_AFTER_S = 3.0            # через сколько секунд (реальных) без рестарта нажимать клавишу меню (--menu-keys)
+MENU_REPEAT_S = 3.0           # и повторять нажатие с таким интервалом
 
 # --- Награда (на одно решение) ---
 PROGRESS_SCALE = 0.1                          # награда за метр продвижения вдоль призрака
@@ -621,7 +624,7 @@ class Trainer:
 # 7. ПОДКЛЮЧЕНИЕ К ИГРЕ
 # =============================================================================
 
-def make_client(trainer):
+def make_client(trainer, menu_keys=(), game_window=None):
     from tminterface.client import Client
 
     class DQNClient(Client):
@@ -632,17 +635,42 @@ def make_client(trainer):
             self.last_decision = -10**9
             self.waiting_restart = False
             self.prev = None              # (obs, action) предыдущего решения
+            self.last_giveup_t = 0        # игровое время последнего give_up()
+            self.wait_started = None      # реальное время, когда начали ждать рестарт (для --menu-keys)
 
         def on_registered(self, iface):
             iface.set_timeout(10_000)
             iface.set_speed(GAME_SPEED)
             iface.log("Python DQN connected", "success")
             print(f"Подключено. Этап {trainer.stage}, эпизодов {trainer.episodes}. Ctrl+C - остановка.")
+            if menu_keys:
+                threading.Thread(target=self._menu_watchdog, daemon=True).start()
+                print(f"Выход из меню после финиша: клавиши {list(menu_keys)}, если рестарта нет {MENU_AFTER_S:g} с.")
 
         def _restart(self, iface):
             self.tr, self.prev = None, None
             self.waiting_restart = True
+            self.last_giveup_t = self.last_t if self.last_t is not None else 0
+            self.wait_started = time.time()
             iface.give_up()
+
+        def _menu_watchdog(self):
+            """Фоновый поток: если рестарт не наступает (меню после финиша), нажимает клавиши меню в окне игры."""
+            from menu_skip import press_sequence
+            last_press = 0.0
+            while True:
+                time.sleep(0.5)
+                ws = self.wait_started
+                if not self.waiting_restart or ws is None:
+                    continue
+                now = time.time()
+                if now - ws >= MENU_AFTER_S and now - last_press >= MENU_REPEAT_S:
+                    last_press = now
+                    print(f"рестарта нет уже {now - ws:.0f} с (меню после финиша?) - жму {list(menu_keys)}")
+                    try:
+                        press_sequence(list(menu_keys), game_window)
+                    except Exception as e:
+                        print(f"menu_skip: ошибка ({e})")
 
         def on_run_step(self, iface, _time):
             restarted = self.last_t is not None and _time < self.last_t   # время пошло назад = новый заезд
@@ -654,10 +682,13 @@ def make_client(trainer):
             elif self.tr is None and not self.waiting_restart:
                 self._restart(iface)                   # скрипт запущен посреди заезда: начнём честно с нуля
                 return
+            if self.waiting_restart and _time - self.last_giveup_t >= GIVE_UP_RETRY_MS:
+                self.last_giveup_t = _time           # give_up мог не сработать (меню после финиша): пробуем ещё
+                iface.give_up()
             if _time < 0 or self.tr is None:
                 return
-            if _time - self.last_decision < DECISION_EVERY_MS:
-                return
+            if _time - self.last_decision < DECISION_EVERY_MS and not self.tr.finished:
+                return                               # после финиша не ждём следующего решения: заканчиваем заезд сразу
             self.last_decision = _time
 
             raw = RawState.from_sim_state(iface.get_simulation_state())
@@ -700,7 +731,8 @@ def mode_live(args):
     # в режиме --play сохранение только читается: Trainer при play=True ничего не пишет на диск
     trainer = Trainer(backend, state_base=args.state, fresh=args.fresh, play=args.play, reference=load_reference(args),
                       log_path=None if args.play else args.log, git_push=args.git_push and not args.play)
-    client = make_client(trainer)
+    from menu_skip import parse_keys
+    client = make_client(trainer, parse_keys(args.menu_keys), args.game_window)
     print("Подключаюсь к TMInterface0..." + ("  (авто git push включён)" if trainer.git_push else ""))
     try:
         run_client(client, "TMInterface0")
@@ -811,6 +843,9 @@ def main():
     p.add_argument("--git-push", action="store_true",
                    help="--live: при новом рекорде/этапе класть модель и лучший заезд в checkpoints/ и делать git push")
     p.add_argument("--log", default="training_log.csv", help="--live: CSV с одной строкой на заезд ('' - не писать)")
+    p.add_argument("--menu-keys", default="",
+                   help="--live: клавиши для выхода из меню после финиша, через запятую (подбери: python menu_skip.py)")
+    p.add_argument("--game-window", default=None, help="кусок заголовка окна игры (если клавиши не отправляются)")
     p.add_argument("--play", action="store_true", help="--live: только ехать (ε=0), без обучения и сохранения")
     args = p.parse_args()
     mode_selftest(args) if args.selftest else mode_live(args)
