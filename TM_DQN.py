@@ -108,6 +108,14 @@ MENU_REPEAT_S = 3.0           # и повторять нажатие с таки
 PROGRESS_SCALE = 0.1                          # награда за метр продвижения вдоль призрака
 PROGRESS_CLIP = (-2.0, 8.0)                   # прирост за шаг обрезаем: защита от скачков индекса на призраке
 STEP_PENALTY = {1: 0.01, 2: 0.03, 3: 0.03}    # штраф за каждое решение
+# Штрафы за качество езды (на одно решение):
+LATERAL_FREE_M = 6.0                          # до такого смещения от призрака штрафа нет
+LATERAL_PENALTY_PER_M = 0.015                 # дальше: за каждый метр сверх свободной зоны
+LATERAL_PENALTY_MAX = 0.6                     # потолок штрафа за одно решение
+HIT_FREE_MS = 5.0                             # падение скорости за решение (м/с) до этого - обычное торможение, не удар
+HIT_PENALTY_PER_MS = 0.1                      # удар: штраф за каждый м/с потери скорости сверх HIT_FREE_MS
+STEER_CHANGE_PENALTY = 0.05                   # за полный размах руля (-1 -> +1 даёт 2 * это); гасит дёрганье
+SAVE_VERSION = 3                              # менять при смене набора действий/наблюдения: старое сохранение отвергается
 CP_REWARD = 20.0                               # за каждый чекпоинт (финиш тоже считается)
 FINISH_REWARD = 30.0
 TIME_REWARD_PER_SEC = {1: 0.0, 2: 0.3, 3: 0.3}  # за секунду, сэкономленную до MAX_EPISODE_MS
@@ -127,7 +135,7 @@ REPO_DIR = os.path.dirname(os.path.abspath(__file__))   # репозиторий
 CHECKPOINT_DIR = "checkpoints"                          # сюда складываются модель, лучший заезд, лог
 GIT_PUSH_MIN_INTERVAL_S = 600                           # не чаще раза в 10 минут (события между ними объединяются)
 LOG_HEADER = ["episode", "stage", "eps", "reward", "progress_m", "checkpoints", "reason", "decisions",
-              "finish_ms", "loss", "best_time_ms", "unix_time"]
+              "finish_ms", "loss", "best_time_ms", "unix_time", "hits"]
 
 
 # =============================================================================
@@ -135,15 +143,19 @@ LOG_HEADER = ["episode", "stage", "eps", "reward", "progress_m", "checkpoints", 
 # =============================================================================
 # (accelerate, brake, steer). steer: отрицательный = влево, положительный = вправо.
 ACTIONS = [
-    (True,  False,       0),   # 0 газ, прямо
-    (True,  False,  -32768),   # 1 газ, влево вполсилы
-    (True,  False,   32768),   # 2 газ, вправо вполсилы
-    (True,  False,  -65536),   # 3 газ, влево до упора
-    (True,  False,   65536),   # 4 газ, вправо до упора
-    (False, False,       0),   # 5 накат, прямо
-    (False, True,        0),   # 6 тормоз, прямо
-    (False, False,  -65536),   # 7 накат, влево
-    (False, False,   65536),   # 8 накат, вправо
+    (True,  False,       0),   # 0  газ, прямо
+    (True,  False,   -9830),   # 1  газ, влево 0.15
+    (True,  False,    9830),   # 2  газ, вправо 0.15
+    (True,  False,  -19661),   # 3  газ, влево 0.3
+    (True,  False,   19661),   # 4  газ, вправо 0.3
+    (True,  False,  -39322),   # 5  газ, влево 0.6
+    (True,  False,   39322),   # 6  газ, вправо 0.6
+    (True,  False,  -65536),   # 7  газ, влево до упора
+    (True,  False,   65536),   # 8  газ, вправо до упора
+    (False, False,       0),   # 9  накат, прямо
+    (False, True,        0),   # 10 тормоз, прямо
+    (False, False,  -65536),   # 11 накат, влево
+    (False, False,   65536),   # 12 накат, вправо
 ]
 N_ACTIONS = len(ACTIONS)
 
@@ -168,6 +180,9 @@ class Tracker:
         self.total_reward, self.steps = 0.0, 0
         self.samples = deque()
         self.path_x, self.path_z = [], []
+        self.prev_speed = None        # горизонтальная скорость на прошлом решении (для обнаружения ударов)
+        self._seen_steer = 0.0        # руль, который был на прошлом решении (для штрафа за дёрганье)
+        self.hits = 0                 # сколько ударов за заезд
 
     def on_checkpoint(self, current, target, t_ms):
         self.cp = current
@@ -189,6 +204,17 @@ class Tracker:
 
         # --- награда ---
         reward = -STEP_PENALTY[self.stage]
+        speed = math.hypot(raw.vel[0], raw.vel[2])
+        if self.prev_speed is not None and self.prev_speed - speed > HIT_FREE_MS:      # резкая потеря скорости = удар
+            reward -= HIT_PENALTY_PER_MS * (self.prev_speed - speed - HIT_FREE_MS)
+            self.hits += 1
+        self.prev_speed = speed
+        if self.ghost is not None:                                                      # уход с линии призрака
+            lat = abs(self.ghost.lateral_m(x, z))
+            if lat > LATERAL_FREE_M:
+                reward -= min(LATERAL_PENALTY_MAX, LATERAL_PENALTY_PER_M * (lat - LATERAL_FREE_M))
+        reward -= STEER_CHANGE_PENALTY * abs(self.prev_steer - self._seen_steer) / STEER_MAX   # дёрганье руля
+        self._seen_steer = self.prev_steer
         if self.last_progress is not None:
             reward += PROGRESS_SCALE * max(PROGRESS_CLIP[0], min(PROGRESS_CLIP[1], p - self.last_progress))
         self.last_progress = p
@@ -361,7 +387,7 @@ class ReplayBuffer:
 
 class Trainer:
     def __init__(self, backend, state_base=STATE_BASE, fresh=False, play=False, seed=None, reference=None,
-                 log_path=None, git_push=False):
+                 log_path=None, git_push=False, force_reference=False):
         self.backend, self.state_base, self.play = backend, state_base, play
         self.log_path, self.git_push = log_path, git_push
         self._pending_event, self._last_push, self._push_thread = None, 0.0, None
@@ -383,14 +409,17 @@ class Trainer:
                   f"рекорд {self._fmt(self.best_time_ms)}")
         else:
             print("Начинаю с нуля.")
-        self._apply_reference(reference)
+        self._apply_reference(reference, force_reference)
 
-    def _apply_reference(self, ref):
+    def _apply_reference(self, ref, force=False):
         """Эталон (твой заезд из CSV) становится призраком, если он лучше текущего (финишировал и быстрее).
         Когда агент проедет быстрее эталона, призрак заменится его заездом."""
         if ref is None:
             return
-        if self.ghost is None or ref.key() > self.ghost.key():
+        if force:
+            self.ghost, self.eps_since_best = ref, 0
+            print(f"Призрак принудительно заменён эталоном: длина {ref.length:.0f} м, время {ref.finish_ms / 1000:.2f} с.")
+        elif self.ghost is None or ref.key() > self.ghost.key():
             self.ghost = ref
             print(f"Призрак = эталон: длина {ref.length:.0f} м, время {ref.finish_ms / 1000:.2f} с.")
         else:
@@ -467,6 +496,8 @@ class Trainer:
             if event:
                 self._pending_event = event       # запомним: отправим на GitHub, как только пройдёт пауза
             self._maybe_push()
+        if self.play:
+            self._log_episode(tr)                  # в режиме оценки пишем только лог заездов (в отдельный файл)
         loss = "-" if self.last_loss is None else f"{self.last_loss:.3f}"
         return (f"эп {self.episodes:4d} | этап {self.stage} | eps {self.epsilon():.2f} | награда {tr.total_reward:7.1f} | "
                 f"прогресс {tr.best_progress:6.0f} м | cp {tr.cp} | {tr.reason:13s} | решений {tr.steps:5d} | "
@@ -487,7 +518,7 @@ class Trainer:
                             round(tr.best_progress, 1), tr.cp, tr.reason, tr.steps,
                             tr.finish_ms if tr.finished else "",
                             "" if self.last_loss is None else round(self.last_loss, 4),
-                            "" if self.best_time_ms is None else self.best_time_ms, int(time.time())])
+                            "" if self.best_time_ms is None else self.best_time_ms, int(time.time()), tr.hits])
         except OSError as e:
             print(f"лог: не удалось записать ({e})")
 
@@ -585,6 +616,7 @@ class Trainer:
     def _save(self):
         g = self.ghost
         data = dict(
+            save_version=SAVE_VERSION, n_actions=N_ACTIONS,
             step_count=self.step_count, episodes=self.episodes, stage=self.stage,
             best_time_ms=-1 if self.best_time_ms is None else self.best_time_ms,
             eps_since_best=self.eps_since_best, eps_offset=self.eps_offset,
@@ -603,6 +635,10 @@ class Trainer:
     def _load(self):
         try:
             d = np.load(self.state_base + ".npz", allow_pickle=False)
+            if "save_version" not in d.files or int(d["save_version"]) != SAVE_VERSION:
+                print("Сохранение от другой версии программы (другие действия/наблюдение/награда) - не загружаю. "
+                      "Удали dqn_state.npz и dqn_state.pt (и переименуй training_log.csv), начинаю с нуля.")
+                return False
             self.backend.load(self.state_base + ".pt")
             self.step_count, self.episodes, self.stage = int(d["step_count"]), int(d["episodes"]), int(d["stage"])
             bt = int(d["best_time_ms"])
@@ -624,7 +660,30 @@ class Trainer:
 # 7. ПОДКЛЮЧЕНИЕ К ИГРЕ
 # =============================================================================
 
-def make_client(trainer, menu_keys=(), game_window=None):
+def print_eval_summary(results):
+    """results - список (финишировал, время_мс, прогресс_м, причина) по заездам оценки."""
+    n = len(results)
+    fins = [r for r in results if r[0]]
+    prog = sorted(r[2] for r in results)
+    print("\n=== Итог оценки (ε = 0, без обучения) ===")
+    print(f"заездов: {n} | финишей: {len(fins)} ({100.0 * len(fins) / max(1, n):.0f}%)")
+    print(f"прогресс, м: среднее {sum(prog) / n:.0f}, медиана {prog[n // 2]:.0f}, лучший {prog[-1]:.0f}")
+    if fins:
+        ts = [r[1] / 1000.0 for r in fins]
+        print(f"время финиша, с: лучшее {min(ts):.2f}, среднее {sum(ts) / len(ts):.2f}, худшее {max(ts):.2f}")
+    reasons = {}
+    for r in results:
+        reasons[r[3]] = reasons.get(r[3], 0) + 1
+    print("чем кончались: " + ", ".join(f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
+    if n > 1 and len({(round(r[2]), r[3]) for r in results}) == 1:
+        print("ВСЕ заезды одинаковые: игра детерминирована, при ε = 0 агент каждый раз делает одно и то же. "
+              "Для оценки хватает одного заезда (--play-episodes 1).")
+
+
+TRACE_HEADER = ["episode", "t_ms", "x", "y", "z", "speed_kmh", "progress_m", "reward", "action", "gas", "brake",
+                "steer", "q_max"] + [f"q{i}" for i in range(N_ACTIONS)]
+
+def make_client(trainer, menu_keys=(), game_window=None, play_episodes=0, trace_path=None, game_speed=None):
     from tminterface.client import Client
 
     class DQNClient(Client):
@@ -637,10 +696,16 @@ def make_client(trainer, menu_keys=(), game_window=None):
             self.prev = None              # (obs, action) предыдущего решения
             self.last_giveup_t = 0        # игровое время последнего give_up()
             self.wait_started = None      # реальное время, когда начали ждать рестарт (для --menu-keys)
+            self.results = []             # итоги заездов в режиме оценки (--play)
+            self.trace_f = self.trace_w = None
+            if trace_path:                # подробная запись каждого решения (для разбора, что делает агент)
+                self.trace_f = open(trace_path, "w", newline="", encoding="utf-8")
+                self.trace_w = csv.writer(self.trace_f)
+                self.trace_w.writerow(TRACE_HEADER)
 
         def on_registered(self, iface):
             iface.set_timeout(10_000)
-            iface.set_speed(GAME_SPEED)
+            iface.set_speed(game_speed or GAME_SPEED)
             iface.log("Python DQN connected", "success")
             print(f"Подключено. Этап {trainer.stage}, эпизодов {trainer.episodes}. Ctrl+C - остановка.")
             if menu_keys:
@@ -696,7 +761,14 @@ def make_client(trainer, menu_keys=(), game_window=None):
             if self.prev is not None:
                 trainer.observe(self.prev[0], self.prev[1], reward, obs, terminal)
             if self.tr.done:
-                print(trainer.end_episode(self.tr))
+                done_tr = self.tr
+                print(trainer.end_episode(done_tr))
+                if trainer.play:
+                    self.results.append((done_tr.finished, done_tr.finish_ms, done_tr.best_progress, done_tr.reason))
+                    if play_episodes and len(self.results) >= play_episodes:
+                        print_eval_summary(self.results)
+                        iface.close()                 # оценка закончена: отключаемся, run_client вернёт управление
+                        return
                 self._restart(iface)
                 return
             a = trainer.act(obs)
@@ -704,10 +776,21 @@ def make_client(trainer, menu_keys=(), game_window=None):
             iface.set_input_state(accelerate=acc, brake=brk, steer=steer)
             self.tr.prev_steer = float(steer)
             self.prev = (obs, a)
+            if self.trace_w:
+                q = trainer.backend.q_values(obs)
+                self.trace_w.writerow([len(self.results) + 1, _time, round(raw.pos[0], 2), round(raw.pos[1], 2),
+                                       round(raw.pos[2], 2), round(raw.speed, 1), round(self.tr.last_progress, 1),
+                                       round(reward, 3), a, int(acc), int(brk), int(steer), round(float(q.max()), 3),
+                                       *[round(float(v), 3) for v in q]])
+                self.trace_f.flush()
 
         def on_checkpoint_count_changed(self, iface, current, target):
             if self.tr is not None and self.last_t is not None:
                 self.tr.on_checkpoint(current, target, self.last_t)
+
+        def on_deregistered(self, iface):
+            if self.trace_f:
+                self.trace_f.close()
 
         def on_shutdown(self, iface):
             if not trainer.play and trainer.state_base:
@@ -730,9 +813,11 @@ def mode_live(args):
     check_learn_is_written(backend)
     # в режиме --play сохранение только читается: Trainer при play=True ничего не пишет на диск
     trainer = Trainer(backend, state_base=args.state, fresh=args.fresh, play=args.play, reference=load_reference(args),
-                      log_path=None if args.play else args.log, git_push=args.git_push and not args.play)
+                      log_path=(args.eval_log or None) if args.play else (args.log or None), git_push=args.git_push and not args.play,
+                      force_reference=args.force_reference)
     from menu_skip import parse_keys
-    client = make_client(trainer, parse_keys(args.menu_keys), args.game_window)
+    client = make_client(trainer, parse_keys(args.menu_keys), args.game_window, args.play_episodes if args.play else 0,
+                         args.trace or None, args.speed)
     print("Подключаюсь к TMInterface0..." + ("  (авто git push включён)" if trainer.git_push else ""))
     try:
         run_client(client, "TMInterface0")
@@ -764,7 +849,7 @@ class FakeTrack:
         return best
 
     def raw(self, prev_steer=0.0):
-        return RawState(speed=self.v * 3.6, pos=(self.x, 10.0, self.z),
+        return RawState(speed=self.v * 3.6, pos=(self.x, 50.0, self.z),
                         vel=(self.v * math.sin(self.h), 0.0, self.v * math.cos(self.h)),
                         yaw=self.h, pitch=0.0, roll=0.0, prev_steer=prev_steer)
 
@@ -839,6 +924,8 @@ def main():
     p.add_argument("--state", default=STATE_BASE, help="база имени файлов сохранения")
     p.add_argument("--fresh", action="store_true", help="игнорировать сохранение")
     p.add_argument("--reference", metavar="CSV", help="эталон: CSV твоего заезда от TMlogger.py (станет призраком)")
+    p.add_argument("--force-reference", action="store_true",
+                   help="заменить призрак эталоном, даже если призрак в сохранении лучше (обучение при этом продолжается)")
     p.add_argument("--ref-episode", type=int, default=None, help="номер заезда в CSV (столбец episode); по умолчанию последний")
     p.add_argument("--git-push", action="store_true",
                    help="--live: при новом рекорде/этапе класть модель и лучший заезд в checkpoints/ и делать git push")
@@ -846,6 +933,13 @@ def main():
     p.add_argument("--menu-keys", default="",
                    help="--live: клавиши для выхода из меню после финиша, через запятую (подбери: python menu_skip.py)")
     p.add_argument("--game-window", default=None, help="кусок заголовка окна игры (если клавиши не отправляются)")
+    p.add_argument("--play-episodes", type=int, default=0,
+                   help="--live --play: сколько заездов оценки проехать (0 - без остановки); в конце печатается итог")
+    p.add_argument("--speed", type=float, default=None,
+                   help="--live: скорость игры (по умолчанию GAME_SPEED=5). Для просмотра глазами поставь 1")
+    p.add_argument("--trace", default="", metavar="CSV",
+                   help="--play: записать каждое решение (позиция, скорость, действие, Q) - для разбора заезда: plot_trace.py")
+    p.add_argument("--eval-log", default="eval_log.csv", help="--play: CSV с заездами оценки ('' - не писать)")
     p.add_argument("--play", action="store_true", help="--live: только ехать (ε=0), без обучения и сохранения")
     args = p.parse_args()
     mode_selftest(args) if args.selftest else mode_live(args)

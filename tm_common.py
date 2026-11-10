@@ -39,7 +39,11 @@ YAW_SIGN, YAW_OFFSET, SIDE_SIGN = 1.0, 0.0, 1.0
 GHOST_SPACING = 1.0                      # м: шаг, с которым путь пересчитывается равномерно
 GHOST_BACK, GHOST_FWD = 20, 80           # окно поиска ближайшей точки (в точках), защита от скачков
 GHOST_ANGLE_SPAN = 3                     # точек в каждую сторону для оценки направления (сглаживание)
-GHOST_LOOKAHEADS_M = (10.0, 25.0, 50.0)  # на сколько метров вперёд смотрим на поворот
+# Взгляд вперёд зависит от СКОРОСТИ: смотрим туда, куда машина приедет через 0.5, 1 и 2 секунды.
+# На 100 м/с (360 км/ч) это 50, 100 и 200 м; на малой скорости не ближе GHOST_LOOKAHEAD_MIN_M.
+GHOST_LOOKAHEAD_S = (0.5, 1.0, 2.0)
+GHOST_LOOKAHEAD_MIN_M = (10.0, 20.0, 40.0)
+GHOST_LOOKAHEAD_MAX_M = 300.0
 GHOST_HALF_WIDTH = 16.0                  # м: масштаб бокового смещения от призрака
 
 
@@ -82,7 +86,7 @@ class RawState:
 OBS_NAMES = ["v_forward", "v_side", "v_up", "sin_heading", "cos_heading",
              "dx_from_start", "dz_from_start", "pitch", "roll", "prev_steer",
              "sin_ghost_err", "cos_ghost_err", "ghost_lateral",
-             "ghost_turn_10m", "ghost_turn_25m", "ghost_turn_50m"]
+             "ghost_turn_0.5s", "ghost_turn_1s", "ghost_turn_2s"]
 OBS_SIZE = len(OBS_NAMES)
 NO_GHOST_FEATURES = (0.0, 1.0, 0.0, 0.0, 0.0, 0.0)   # пока призрака нет: ошибки курса нет (cos = 1)
 
@@ -196,14 +200,22 @@ class Ghost:
             p += math.hypot(x - self.x[-1], z - self.z[-1])
         return p
 
-    def features(self, x, z, h):
-        """6 признаков относительно призрака. Вызывать после progress_at (он выбирает ближайшую точку)."""
+    def lateral_m(self, x, z):
+        """Боковое смещение от призрака, метры (со знаком). Вызывать после progress_at."""
+        idx = self.last_idx
+        th = self.angle[idx]
+        return SIDE_SIGN * ((x - self.x[idx]) * math.cos(th) - (z - self.z[idx]) * math.sin(th))
+
+    def features(self, x, z, h, speed=0.0):
+        """6 признаков относительно призрака. Вызывать после progress_at (он выбирает ближайшую точку).
+        speed - горизонтальная скорость машины, м/с: от неё зависит, как далеко вперёд смотрим на поворот."""
         idx = self.last_idx
         th = self.angle[idx]
         err = wrap_angle(th - h)
-        lateral = SIDE_SIGN * ((x - self.x[idx]) * math.cos(th) - (z - self.z[idx]) * math.sin(th))
-        ahead = [wrap_angle(self.angle[min(self.n - 1, idx + int(round(m / GHOST_SPACING)))] - h)
-                 for m in GHOST_LOOKAHEADS_M]
+        lateral = self.lateral_m(x, z)
+        dists = [min(GHOST_LOOKAHEAD_MAX_M, max(dmin, speed * t))
+                 for t, dmin in zip(GHOST_LOOKAHEAD_S, GHOST_LOOKAHEAD_MIN_M)]
+        ahead = [wrap_angle(self.angle[min(self.n - 1, idx + int(round(d / GHOST_SPACING)))] - h) for d in dists]
         return (math.sin(err), math.cos(err), max(-1.0, min(1.0, lateral / GHOST_HALF_WIDTH)),
                 ahead[0] / math.pi, ahead[1] / math.pi, ahead[2] / math.pi)
 
@@ -235,7 +247,7 @@ class ObservationBuilder:
         feats = NO_GHOST_FEATURES
         if self.ghost is not None:
             progress = self.ghost.progress_at(x, z)
-            feats = self.ghost.features(x, z, h)
+            feats = self.ghost.features(x, z, h, math.hypot(raw.vel[0], raw.vel[2]))
         else:
             progress = math.hypot(x - self.start[0], z - self.start[1])
         return build_observation(raw, self.start, feats), progress

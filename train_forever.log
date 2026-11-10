@@ -24,3 +24,6 @@
 [2026-11-07 20:44:57] график обучения: training_progress.png (обновляется каждые 300 с)
 [2026-11-07 20:44:57] запуск: C:\Users\den\AppData\Local\Python\pythoncore-3.14-64\python.exe tm_dqn.py --live --reference reference.csv --menu-keys enter
 [2026-11-07 21:55:56] Ctrl+C: останавливаю агента (он сохранится)
+[2026-11-07 23:33:06] график обучения: training_progress.png (обновляется каждые 300 с)
+[2026-11-07 23:33:06] запуск: C:\Users\den\AppData\Local\Python\pythoncore-3.14-64\python.exe tm_dqn.py --live --reference reference.csv --menu-keys enter
+[2026-11-07 23:53:03] Ctrl+C: останавливаю агента (он сохранится)
